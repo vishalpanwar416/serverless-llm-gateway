@@ -1,0 +1,64 @@
+# docker compose up --build
+# then send requests to http://localhost:8080 with "Authorization: Bearer sk-gw-local-demo-key"
+#
+# mock mode is on by default so you don't need any keys.
+# for a real model: MOCK_MODE=false docker compose --profile ollama up --build
+
+services:
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: dynamodb
+      AWS_DEFAULT_REGION: ap-southeast-2
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  gateway:
+    build: .
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # dynamodb (localstack)
+      AWS_REGION: ap-southeast-2
+      AWS_ACCESS_KEY_ID: test            # localstack doesn't check these
+      AWS_SECRET_ACCESS_KEY: test
+      DYNAMODB_ENDPOINT: http://localstack:4566
+      API_KEYS_TABLE: llm-gateway-api-keys
+      CACHE_TABLE: llm-gateway-cache
+      # demo key for local testing only, added by scripts/bootstrap_local.py
+      GATEWAY_DEMO_API_KEY: ${GATEWAY_DEMO_API_KEY:-sk-gw-local-demo-key}
+
+      # providers
+      MOCK_MODE: ${MOCK_MODE:-true}
+      MOCK_FAILURES: ${MOCK_FAILURES:-}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-ollama}
+      FALLBACK_TARGETS: ${FALLBACK_TARGETS:-ollama:llama3.2:1b}
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-5}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-30}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # so it can reach ollama running on your machine
+
+  # optional, only starts with --profile ollama. pulls the model the first time.
+  ollama:
+    image: ollama/ollama:0.21.0
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    entrypoint: ["sh", "-c", "ollama serve & sleep 3 && ollama pull ${OLLAMA_MODEL:-llama3.2:1b} && wait"]
+
+volumes:
+  ollama-models:

@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless LLM Gateway - API Gateway (HTTP API) + Lambda + DynamoDB
+
+Parameters:
+  MockMode:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  DefaultProvider:
+    Type: String
+    Default: ollama
+  FallbackTargets:
+    Type: String
+    Default: "ollama:llama3.2:1b"
+    Description: Comma-separated provider:model fallback chain.
+  OllamaBaseUrl:
+    Type: String
+    Default: ""
+    Description: Reachable Ollama endpoint (e.g. on EC2/ECS). Leave empty to disable.
+  ProviderSecretArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional Secrets Manager secret holding JSON {"OPENAI_API_KEY": "...", "ANTHROPIC_API_KEY": "..."}.
+
+Conditions:
+  HasProviderSecret: !Not [!Equals [!Ref ProviderSecretArn, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 512
+    # leaves room for the primary (5s) plus fallbacks, api gateway cuts off at 30s
+    Timeout: 29
+    Tracing: Active
+
+Resources:
+  ApiKeysTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: key_hash, AttributeType: S }
+      KeySchema:
+        - { AttributeName: key_hash, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: cache_key, AttributeType: S }
+      KeySchema:
+        - { AttributeName: cache_key, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  GatewayApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: gateway.handler.lambda_handler
+      Environment:
+        Variables:
+          MOCK_MODE: !Ref MockMode
+          DEFAULT_PROVIDER: !Ref DefaultProvider
+          FALLBACK_TARGETS: !Ref FallbackTargets
+          OLLAMA_BASE_URL: !Ref OllamaBaseUrl
+          UPSTREAM_TIMEOUT_SECONDS: "5"
+          API_KEYS_TABLE: !Ref ApiKeysTable
+          CACHE_TABLE: !Ref CacheTable
+          # these get filled in at deploy time, so rotating a key means redeploying.
+          # (see the production notes in the README)
+          OPENAI_API_KEY: !If
+            - HasProviderSecret
+            - !Sub "{{resolve:secretsmanager:${ProviderSecretArn}:SecretString:OPENAI_API_KEY}}"
+            - ""
+          ANTHROPIC_API_KEY: !If
+            - HasProviderSecret
+            - !Sub "{{resolve:secretsmanager:${ProviderSecretArn}:SecretString:ANTHROPIC_API_KEY}}"
+            - ""
+      Policies:
+        # only the dynamo actions the code actually uses
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ApiKeysTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt CacheTable.Arn
+      Events:
+        ChatCompletions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GatewayApi
+            Path: /v1/chat/completions
+            Method: POST
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GatewayApi
+            Path: /health
+            Method: GET
+
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GatewayFunction}
+      RetentionInDays: 14
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the gateway
+    Value: !Sub https://${GatewayApi}.execute-api.${AWS::Region}.amazonaws.com
+  ApiKeysTableName:
+    Value: !Ref ApiKeysTable
+  CacheTableName:
+    Value: !Ref CacheTable
