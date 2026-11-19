@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .aws-sam/
 .env
+.env.deployed
 samconfig.toml
 
 # assignment brief
